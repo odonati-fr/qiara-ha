@@ -44,17 +44,19 @@
   "options": {
     "step": {
       "init": {
-        "title": "Update Qiara Credentials",
+        "title": "Qiara Options",
         "data": {
           "host": "Host",
           "customer_id": "Customer ID",
-          "secret_key": "Secret Key",
-          "port": "API port (optional)"
+          "secret_key": "Secret Key (optional)",
+          "port": "API port (optional)",
+          "scan_interval": "Polling interval (seconds)"
         },
         "data_description": {
           "host": "IP address or hostname of your Qiara hub on the local network, e.g. 192.0.2.10 or lwip.localdomain",
-          "secret_key": "The HMAC secret key from the Qiara APK or admin settings. Keep this confidential.",
-          "port": "Only change this if your hub uses a non-standard API port (default 64218)."
+          "secret_key": "Leave empty to keep the current secret key.",
+          "port": "Only change this if your hub uses a non-standard API port (default 64218).",
+          "scan_interval": "How often the device is polled (5 to 300 s). It is also the delay before an opening or a motion shows up."
         }
       }
     },

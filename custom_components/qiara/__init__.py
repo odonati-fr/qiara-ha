@@ -11,7 +11,8 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DEFAULT_BASE_URL, DOMAIN
+from .const import CONF_CUSTOMER_ID, DEFAULT_BASE_URL, DOMAIN
+from .config_flow import host_port_from_entry, entry_unique_id
 from .coordinator import QiaraDataUpdateCoordinator
 from .api import QiaraApi
 
@@ -35,6 +36,15 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "Please remove and re-add the Qiara integration to supply your Customer ID and Secret Key."
         )
         return False
+
+    if entry.version == 1 and entry.minor_version < 2:
+        # 1.2: one entry per device, so the unique id carries the host.
+        host, _port = host_port_from_entry(entry.data)
+        hass.config_entries.async_update_entry(
+            entry,
+            unique_id=entry_unique_id(entry.data[CONF_CUSTOMER_ID], host),
+            minor_version=2,
+        )
 
     return True
 
@@ -67,7 +77,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hub = dr.async_get(hass).async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, entry.entry_id)},
-        name="Qiara Security System",
+        # A slave camera carries no alarm: name its device after the entry.
+        name="Qiara Security System" if api.get_alarm_node_id() is not None else entry.title,
         manufacturer="Qiara",
     )
     coordinator.hub_device_id = hub.id

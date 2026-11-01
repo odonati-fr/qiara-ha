@@ -157,6 +157,10 @@ class QiaraApi:
         """Return the camera node ID discovered from the nodes list."""
         return self._camera_node_id
 
+    def get_alarm_node_id(self) -> int | None:
+        """Return the alarm node ID, or None on a device without one (slave camera)."""
+        return self._alarm_node_id
+
     async def async_ensure_session(self) -> str:
         """Return a valid session ID, re-authenticating if needed."""
         return await self._client._ensure_session()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -20,11 +21,29 @@ from ..const import DEFAULT_BASE_URL
 _LOGGER = logging.getLogger(__name__)
 
 
-def _generate_hmac_response(challenge: str, key: str) -> str:
+def _generate_hmac_response(challenge: str, key: bytes) -> str:
     """Compute HMAC-SHA1 challenge response for Qiara authentication."""
-    key_bytes = base64.b64decode(key)
-    digest = hmac.new(key_bytes, challenge.encode("utf-8"), hashlib.sha1)
+    digest = hmac.new(key, challenge.encode("utf-8"), hashlib.sha1)
     return digest.hexdigest()
+
+
+def _hmac_key_candidates(secret: str) -> list[bytes]:
+    """Return the HMAC keys a secret may stand for, most likely first.
+
+    The device keys the HMAC with the AuthToken string from fbxhome.xml as-is
+    (Freebox-style); some tokens there are URL-safe base64 without padding.
+    The base64-decoded secret is kept as a fallback for setups where it is the
+    key, including secrets entered as base64 of the token.
+    """
+    candidates = [secret.encode("utf-8")]
+    padded = secret + "=" * (-len(secret) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded)
+    except (binascii.Error, ValueError):
+        return candidates
+    if decoded and decoded not in candidates:
+        candidates.append(decoded)
+    return candidates
 
 
 class AsyncRESTResponse:
@@ -109,27 +128,54 @@ class QiaraApiClient:
         self._secret_key = secret_key
         self._base_url = base_url.rstrip("/")
         self._session_id: str | None = None
+        # Key that last authenticated successfully, tried first next time.
+        self._hmac_key: bytes | None = None
 
         config = Configuration(host=self._base_url)
         config.verify_ssl = False
         self._api_client = QiaraAsyncApiClient(session, config)
 
     async def _authenticate(self) -> None:
-        """Perform challenge/response auth and cache the resulting session ID."""
-        challenge_resp = await self._api_client.call_api_async(
-            "GET", f"{self._base_url}/login/challenge"
-        )
-        challenge_str = json.loads(challenge_resp.data)["challenge"]
-        hmac_response = _generate_hmac_response(challenge_str, self._secret_key)
+        """Perform challenge/response auth and cache the resulting session ID.
 
-        session_resp = await self._api_client.call_api_async(
-            "POST",
-            f"{self._base_url}/login/new",
-            header_params={"Content-Type": "application/json"},
-            body={"cust_id": self._customer_id, "challenge_rsp": hmac_response},
-        )
-        self._session_id = json.loads(session_resp.data)["session"]
-        _LOGGER.debug("Qiara: authenticated successfully")
+        Each candidate key needs a fresh challenge. The device answers a wrong
+        key with HTTP 400 and a message ("bad challenge response") instead of a
+        session.
+        """
+        keys = _hmac_key_candidates(self._secret_key)
+        if self._hmac_key in keys:
+            keys.remove(self._hmac_key)
+            keys.insert(0, self._hmac_key)
+
+        rejection = ""
+        for key in keys:
+            challenge_resp = await self._api_client.call_api_async(
+                "GET", f"{self._base_url}/login/challenge"
+            )
+            challenge_str = json.loads(challenge_resp.data)["challenge"]
+            session_resp = await self._api_client.call_api_async(
+                "POST",
+                f"{self._base_url}/login/new",
+                header_params={"Content-Type": "application/json"},
+                body={
+                    "cust_id": self._customer_id,
+                    "challenge_rsp": _generate_hmac_response(challenge_str, key),
+                },
+            )
+            try:
+                body = json.loads(session_resp.data)
+            except ValueError:
+                body = {}
+            if isinstance(body, dict) and body.get("session"):
+                self._session_id = body["session"]
+                self._hmac_key = key
+                _LOGGER.debug("Qiara: authenticated successfully")
+                return
+            rejection = body.get("message", "") if isinstance(body, dict) else ""
+            _LOGGER.debug(
+                "Qiara: login rejected (HTTP %s: %s)", session_resp.status, rejection or "no session"
+            )
+        raise ConfigEntryAuthFailed(f"Qiara login rejected: {rejection or 'no session returned'}")
 
     async def async_validate_credentials(self) -> None:
         """Validate credentials by performing a full authentication. Raises on failure."""

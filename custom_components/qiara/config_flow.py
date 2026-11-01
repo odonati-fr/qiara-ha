@@ -18,9 +18,13 @@ from .const import (
     CONF_CUSTOMER_ID,
     CONF_HOST,
     CONF_PORT,
+    CONF_SCAN_INTERVAL,
     CONF_SECRET_KEY,
     DEFAULT_API_PORT,
+    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    MAX_SCAN_INTERVAL,
+    MIN_SCAN_INTERVAL,
     build_base_url,
 )
 
@@ -46,12 +50,38 @@ def _data_schema(host: str = "", port: int = DEFAULT_API_PORT, customer_id: Any 
     )
 
 
-def _host_port_from_entry(data: Mapping[str, Any]) -> tuple[str, int]:
+def _options_schema(
+    host: str, port: int, customer_id: Any, scan_interval: int
+) -> vol.Schema:
+    """Build the options form: the setup fields with the secret optional (kept
+    when left empty), plus the polling interval."""
+    return vol.Schema(
+        {
+            vol.Required(CONF_HOST, default=host): str,
+            vol.Required(CONF_CUSTOMER_ID, default=customer_id): vol.Coerce(int),
+            vol.Optional(CONF_SECRET_KEY): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+            ),
+            vol.Optional(CONF_PORT, default=port): vol.Coerce(int),
+            vol.Optional(CONF_SCAN_INTERVAL, default=scan_interval): vol.All(
+                vol.Coerce(int), vol.Range(min=MIN_SCAN_INTERVAL, max=MAX_SCAN_INTERVAL)
+            ),
+        }
+    )
+
+
+def host_port_from_entry(data: Mapping[str, Any]) -> tuple[str, int]:
     """Return (host, port) for pre-filling a form, incl. legacy base_url entries."""
     if data.get(CONF_HOST):
         return data[CONF_HOST], data.get(CONF_PORT, DEFAULT_API_PORT)
     parts = urlsplit(data.get(CONF_BASE_URL, ""))
     return parts.hostname or "", parts.port or DEFAULT_API_PORT
+
+
+def entry_unique_id(customer_id: Any, host: str) -> str:
+    """Unique id of an entry: one per device, since every camera of a system
+    (master or slave) has its own API and its own token for the same customer."""
+    return f"{customer_id}@{host}"
 
 
 def _entry_data(user_input: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +108,8 @@ class QiaraConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Qiara."""
 
     VERSION = 1
+    # 1.2: unique id is "<customer_id>@<host>" instead of the customer id alone.
+    MINOR_VERSION = 2
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -101,10 +133,12 @@ class QiaraConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected error during Qiara setup")
                 errors["base"] = "cannot_connect"
             else:
-                await self.async_set_unique_id(str(data[CONF_CUSTOMER_ID]))
+                await self.async_set_unique_id(
+                    entry_unique_id(data[CONF_CUSTOMER_ID], data[CONF_HOST])
+                )
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
-                    title=f"Qiara ({data[CONF_CUSTOMER_ID]})",
+                    title=f"Qiara {data[CONF_HOST]}",
                     data=data,
                 )
 
@@ -124,7 +158,7 @@ class QiaraConfigFlow(ConfigFlow, domain=DOMAIN):
         """Handle reauth credential form."""
         errors: dict[str, str] = {}
         entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
-        host, port = _host_port_from_entry(entry.data)
+        host, port = host_port_from_entry(entry.data)
 
         if user_input is not None:
             data = _entry_data(user_input)
@@ -142,7 +176,11 @@ class QiaraConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected error during Qiara reauth")
                 errors["base"] = "cannot_connect"
             else:
-                self.hass.config_entries.async_update_entry(entry, data=data)
+                self.hass.config_entries.async_update_entry(
+                    entry,
+                    data=data,
+                    unique_id=entry_unique_id(data[CONF_CUSTOMER_ID], data[CONF_HOST]),
+                )
                 await self.hass.config_entries.async_reload(entry.entry_id)
                 return self.async_abort(reason="reauth_successful")
             host, port = data[CONF_HOST], data[CONF_PORT]
@@ -160,7 +198,7 @@ class QiaraConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class QiaraOptionsFlow(OptionsFlow):
-    """Handle Qiara options — allows updating credentials/host post-setup."""
+    """Handle Qiara options — credentials/host and polling interval post-setup."""
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         self._config_entry = config_entry
@@ -170,9 +208,13 @@ class QiaraOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         """Manage options."""
         errors: dict[str, str] = {}
-        host, port = _host_port_from_entry(self._config_entry.data)
+        host, port = host_port_from_entry(self._config_entry.data)
+        scan_interval = self._config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
 
         if user_input is not None:
+            scan_interval = user_input.pop(CONF_SCAN_INTERVAL, scan_interval)
+            if not user_input.get(CONF_SECRET_KEY):
+                user_input[CONF_SECRET_KEY] = self._config_entry.data[CONF_SECRET_KEY]
             data = _entry_data(user_input)
             try:
                 await _validate_credentials(
@@ -188,12 +230,21 @@ class QiaraOptionsFlow(OptionsFlow):
                 _LOGGER.exception("Unexpected error during Qiara options update")
                 errors["base"] = "cannot_connect"
             else:
-                self.hass.config_entries.async_update_entry(self._config_entry, data=data)
-                return self.async_create_entry(title="", data={})
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry,
+                    data=data,
+                    unique_id=entry_unique_id(data[CONF_CUSTOMER_ID], data[CONF_HOST]),
+                )
+                return self.async_create_entry(
+                    title="",
+                    data={**self._config_entry.options, CONF_SCAN_INTERVAL: scan_interval},
+                )
             host, port = data[CONF_HOST], data[CONF_PORT]
 
         return self.async_show_form(
             step_id="init",
-            data_schema=_data_schema(host, port, self._config_entry.data.get(CONF_CUSTOMER_ID)),
+            data_schema=_options_schema(
+                host, port, self._config_entry.data.get(CONF_CUSTOMER_ID), scan_interval
+            ),
             errors=errors,
         )

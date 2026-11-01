@@ -353,3 +353,20 @@ def test_coordinator_sync_keeps_pending_optimistic_state(alarm_panel, mock_coord
     alarm_panel._handle_coordinator_update()
 
     assert alarm_panel.alarm_state == AlarmControlPanelState.ARMING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("alarm_node", "expected"), [(2, 1), (None, 0)])
+async def test_setup_entry_only_with_alarm_node(mock_coordinator, mock_entry, alarm_node, expected):
+    """The panel is created for the master camera only, not for a slave one."""
+    from custom_components.qiara.alarm_control_panel import async_setup_entry
+    from custom_components.qiara.const import DOMAIN
+
+    mock_coordinator.api.get_alarm_node_id.return_value = alarm_node
+    hass = MagicMock()
+    hass.data = {DOMAIN: {mock_entry.entry_id: mock_coordinator}}
+    added = []
+
+    await async_setup_entry(hass, mock_entry, added.extend)
+
+    assert len(added) == expected

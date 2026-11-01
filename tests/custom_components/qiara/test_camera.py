@@ -38,6 +38,7 @@ from custom_components.qiara.const import DOMAIN
 from custom_components.qiara.coordinator import QiaraDataUpdateCoordinator
 
 CAMERA_NODE = 5
+ENTRY_ID = "entry"
 
 
 @pytest.fixture
@@ -60,6 +61,7 @@ def camera(mock_api):
     coordinator = MagicMock()
     coordinator.api = mock_api
     entry = MagicMock()
+    entry.entry_id = ENTRY_ID
     entry.options = {}
     cam = QiaraCamera(coordinator, entry, str(CAMERA_NODE))
     hass = MagicMock()
@@ -85,7 +87,7 @@ async def test_provider_probe_does_not_touch_shutter(camera, mock_api):
     with patch.object(Camera, "async_refresh_providers", fake_refresh):
         await camera.async_refresh_providers(write_state=False)
 
-    assert seen == [f"rtsp://127.0.0.1:18554/qiara_camera_{CAMERA_NODE}"]
+    assert seen == [f"rtsp://127.0.0.1:18554/qiara_camera_{ENTRY_ID}_{CAMERA_NODE}"]
     mock_api.async_activate_camera.assert_not_called()
     mock_api.async_open_stream.assert_not_called()
     camera.hass.async_create_background_task.assert_not_called()
@@ -101,7 +103,7 @@ async def test_real_stream_request_opens_shutter_and_starts_watcher(camera, mock
     ):
         url = await camera.stream_source()
 
-    assert url == f"rtsp://127.0.0.1:18554/qiara_camera_{CAMERA_NODE}"
+    assert url == f"rtsp://127.0.0.1:18554/qiara_camera_{ENTRY_ID}_{CAMERA_NODE}"
     mock_api.async_open_stream.assert_awaited_once_with(force=True)
     mock_api.async_activate_camera.assert_awaited_once_with(CAMERA_NODE)
     client.streams.add.assert_awaited_once()
@@ -167,7 +169,7 @@ async def test_hls_url_carries_proxy_token(camera):
         url = await camera._async_hls_stream_source()
 
     assert url == (
-        f"http://ha.local:8123/api/qiara/camera/{token}/{CAMERA_NODE}/stream/HLS_TEST.m3u8"
+        f"http://ha.local:8123/api/qiara/camera/{token}/{ENTRY_ID}/{CAMERA_NODE}/stream/HLS_TEST.m3u8"
     )
 
 
@@ -175,7 +177,7 @@ def _proxy_request(mock_api):
     coordinator = MagicMock(spec=QiaraDataUpdateCoordinator)
     coordinator.api = mock_api
     hass = MagicMock()
-    hass.data = {DOMAIN: {"entry": coordinator}}
+    hass.data = {DOMAIN: {ENTRY_ID: coordinator}}
     request = MagicMock()
     request.app = {"hass": hass}
     return request
@@ -197,7 +199,7 @@ async def test_proxy_rejects_invalid_requests(mock_api, token_ok, node_id, file,
     proxy = QiaraCameraStreamProxy()
     token = proxy.token if token_ok else "nope"
 
-    resp = await proxy.get(_proxy_request(mock_api), token, node_id, file, quality)
+    resp = await proxy.get(_proxy_request(mock_api), token, ENTRY_ID, node_id, file, quality)
 
     assert resp.status == 404
     mock_api.async_activate_camera.assert_not_called()
@@ -206,7 +208,7 @@ async def test_proxy_rejects_invalid_requests(mock_api, token_ok, node_id, file,
 @pytest.mark.asyncio
 async def test_reused_ha_stream_reopens_shutter(camera):
     """HA reuses its cached Stream without calling stream_source(); reopen the shutter."""
-    camera.stream = MagicMock(source=f"rtsp://127.0.0.1:18554/qiara_camera_{CAMERA_NODE}")
+    camera.stream = MagicMock(source=f"rtsp://127.0.0.1:18554/qiara_camera_{ENTRY_ID}_{CAMERA_NODE}")
     with patch.object(
         Camera, "async_create_stream", AsyncMock(return_value=camera.stream)
     ), patch.object(camera, "_async_srt_stream_source", AsyncMock()) as srt:
@@ -219,10 +221,65 @@ async def test_reused_ha_stream_reopens_shutter(camera):
 async def test_first_ha_stream_does_not_double_open(camera):
     """On first creation stream_source() already opened the shutter."""
     camera.stream = None
-    new_stream = MagicMock(source=f"rtsp://127.0.0.1:18554/qiara_camera_{CAMERA_NODE}")
+    new_stream = MagicMock(source=f"rtsp://127.0.0.1:18554/qiara_camera_{ENTRY_ID}_{CAMERA_NODE}")
     with patch.object(
         Camera, "async_create_stream", AsyncMock(return_value=new_stream)
     ), patch.object(camera, "_async_srt_stream_source", AsyncMock()) as srt:
         await camera.async_create_stream()
 
     srt.assert_not_awaited()
+
+
+# --- Several entries (master + slave cameras) --------------------------------
+
+
+def test_camera_ids_are_scoped_by_entry(mock_api):
+    """Slave cameras all report node 1: entity and device ids must not collide."""
+    coordinator = MagicMock()
+    coordinator.api = mock_api
+    ids = set()
+    for entry_id in ("master", "slave"):
+        entry = MagicMock(entry_id=entry_id, options={})
+        cam = QiaraCamera(coordinator, entry, "1")
+        ids.add((cam.unique_id, next(iter(cam.device_info["identifiers"]))))
+    assert ids == {
+        ("master_camera_1", (DOMAIN, "master_1")),
+        ("slave_camera_1", (DOMAIN, "slave_1")),
+    }
+
+
+@pytest.mark.asyncio
+async def test_proxy_uses_the_requested_entry(mock_api):
+    """The proxy opens the shutter of the entry named in the URL, not the first one."""
+    other_api = MagicMock()
+    other_api.get_camera_node_id.return_value = CAMERA_NODE
+    other_api.async_activate_camera = AsyncMock()
+    request = _proxy_request(mock_api)
+    other = MagicMock(spec=QiaraDataUpdateCoordinator)
+    other.api = other_api
+    # "other" first: the old proxy took the first coordinator it found.
+    request.app["hass"].data[DOMAIN] = {"other": other, ENTRY_ID: request.app["hass"].data[DOMAIN][ENTRY_ID]}
+    proxy = QiaraCameraStreamProxy()
+    proxy._reset_idle_timer = MagicMock()
+    mock_api.async_ensure_session = AsyncMock(side_effect=RuntimeError("stop here"))
+
+    with patch("custom_components.qiara.camera.async_get_clientsession"):
+        await proxy.get(request, proxy.token, ENTRY_ID, str(CAMERA_NODE), "HLS_TEST.m3u8")
+
+    mock_api.async_activate_camera.assert_awaited_once_with(CAMERA_NODE)
+    other_api.async_activate_camera.assert_not_called()
+
+
+def test_proxy_shutdown_only_cancels_its_entry():
+    """Unloading one entry must not cancel another entry's idle timer."""
+    proxy = QiaraCameraStreamProxy()
+    mine, theirs = MagicMock(), MagicMock()
+    proxy._idle_tasks = {("a", 1): mine, ("b", 1): theirs}
+    proxy._shutter_open = {("a", 1), ("b", 1)}
+
+    proxy.shutdown("a")
+
+    mine.cancel.assert_called_once()
+    theirs.cancel.assert_not_called()
+    assert proxy._idle_tasks == {("b", 1): theirs}
+    assert proxy._shutter_open == {("b", 1)}

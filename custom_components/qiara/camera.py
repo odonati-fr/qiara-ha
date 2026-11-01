@@ -17,6 +17,7 @@ from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -85,7 +86,7 @@ async def async_setup_entry(
         proxy = QiaraCameraStreamProxy()
         hass.http.register_view(proxy)
         hass.data[DOMAIN][_CAMERA_PROXY_KEY] = proxy
-    entry.async_on_unload(proxy.shutdown)
+    entry.async_on_unload(lambda: proxy.shutdown(entry.entry_id))
 
     # Older versions registered the camera with has_entity_name=True plus a name
     # equal to the device name, producing a doubled friendly name ("Qiara
@@ -96,6 +97,7 @@ async def async_setup_entry(
     for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
         if reg_entry.domain == "camera" and reg_entry.has_entity_name:
             ent_reg.async_remove(reg_entry.entity_id)
+    _migrate_camera_ids(hass, entry)
 
     cameras = [
         QiaraCamera(coordinator, entry, sensor_id)
@@ -103,6 +105,40 @@ async def async_setup_entry(
         if isinstance(data, QiaraSensorData) and data.type == "camera"
     ]
     async_add_entities(cameras)
+
+
+def _migrate_camera_ids(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Scope camera entity and device ids by entry.
+
+    They used to be the bare node id ("qiara_camera_3", device "3"), which
+    collides as soon as several entries are set up: every slave camera reports
+    itself as node 1. Keep the entity (history, customisations) and its device
+    by renaming their ids in place.
+    """
+    ent_reg = er.async_get(hass)
+    dev_reg = dr.async_get(hass)
+    prefix = "qiara_camera_"
+    for reg_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+        if reg_entry.domain != "camera" or not reg_entry.unique_id.startswith(prefix):
+            continue
+        node_id = reg_entry.unique_id.removeprefix(prefix)
+        ent_reg.async_update_entity(
+            reg_entry.entity_id, new_unique_id=camera_unique_id(entry, node_id)
+        )
+        device = dev_reg.async_get_device(identifiers={(DOMAIN, node_id)})
+        if device is not None and entry.entry_id in device.config_entries:
+            dev_reg.async_update_device(
+                device.id, new_identifiers={(DOMAIN, camera_device_key(entry, node_id))}
+            )
+
+
+def camera_unique_id(entry: ConfigEntry, node_id: str) -> str:
+    return f"{entry.entry_id}_camera_{node_id}"
+
+
+def camera_device_key(entry: ConfigEntry, node_id: str) -> str:
+    """Device identifier, scoped by entry like the sensor platforms'."""
+    return f"{entry.entry_id}_{node_id}"
 
 
 def build_srt_url(
@@ -130,8 +166,11 @@ class QiaraCameraStreamProxy(HomeAssistantView):
     """Proxy Qiara HLS stream requests, injecting the session auth header.
 
     Two URL patterns cover the full HLS tree:
-      /api/qiara/camera/{token}/{node_id}/stream/{file}          ← master playlist
-      /api/qiara/camera/{token}/{node_id}/stream/{quality}/{file} ← quality playlist + segments
+      /api/qiara/camera/{token}/{entry_id}/{node_id}/stream/{file}          ← master playlist
+      /api/qiara/camera/{token}/{entry_id}/{node_id}/stream/{quality}/{file} ← quality playlist + segments
+
+    The entry id picks the device: each camera of a system (master or slave)
+    is its own entry, and slaves all report themselves as the same node id.
 
     The stream consumer (HA's stream worker or go2rtc) can't send HA auth
     headers, so the view can't require HA auth. Instead every URL carries a
@@ -139,8 +178,8 @@ class QiaraCameraStreamProxy(HomeAssistantView):
     so relative segment URIs in the playlists keep it.
     """
 
-    url = "/api/qiara/camera/{token}/{node_id}/stream/{file}"
-    extra_urls = ["/api/qiara/camera/{token}/{node_id}/stream/{quality}/{file}"]
+    url = "/api/qiara/camera/{token}/{entry_id}/{node_id}/stream/{file}"
+    extra_urls = ["/api/qiara/camera/{token}/{entry_id}/{node_id}/stream/{quality}/{file}"]
     name = "api:qiara:camera:stream"
     requires_auth = False
     cors_allowed = True
@@ -150,21 +189,23 @@ class QiaraCameraStreamProxy(HomeAssistantView):
 
     def __init__(self) -> None:
         self.token = secrets.token_urlsafe(32)
-        self._shutter_open: set[int] = set()
-        self._idle_tasks: dict[int, asyncio.Task] = {}
+        # Keyed by (entry_id, node_id).
+        self._shutter_open: set[tuple[str, int]] = set()
+        self._idle_tasks: dict[tuple[str, int], asyncio.Task] = {}
 
     @staticmethod
-    def _get_api(hass: HomeAssistant):
-        """Return the API of the first active Qiara coordinator, or None."""
-        for value in hass.data.get(DOMAIN, {}).values():
-            if isinstance(value, QiaraDataUpdateCoordinator):
-                return value.api
+    def _get_api(hass: HomeAssistant, entry_id: str):
+        """Return the API of the entry's coordinator, or None if not loaded."""
+        coordinator = hass.data.get(DOMAIN, {}).get(entry_id)
+        if isinstance(coordinator, QiaraDataUpdateCoordinator):
+            return coordinator.api
         return None
 
     async def get(
         self,
         request: web.Request,
         token: str,
+        entry_id: str,
         node_id: str,
         file: str,
         quality: str | None = None,
@@ -180,7 +221,7 @@ class QiaraCameraStreamProxy(HomeAssistantView):
             return web.Response(status=404)
 
         hass = request.app["hass"]
-        api = self._get_api(hass)
+        api = self._get_api(hass, entry_id)
         if api is None:
             return web.Response(status=503, text="Qiara integration not loaded")
 
@@ -189,19 +230,19 @@ class QiaraCameraStreamProxy(HomeAssistantView):
             return web.Response(status=404)
 
         session = async_get_clientsession(hass, verify_ssl=False)
-        node_id_int = int(node_id)
+        key = (entry_id, int(node_id))
 
         # Activate shutter once per camera (idempotent on the device)
-        if node_id_int not in self._shutter_open:
+        if key not in self._shutter_open:
             try:
-                await api.async_activate_camera(node_id_int)
-                self._shutter_open.add(node_id_int)
+                await api.async_activate_camera(key[1])
+                self._shutter_open.add(key)
                 _LOGGER.debug("Qiara: camera %s shutter opened via proxy", node_id)
             except Exception as err:
                 _LOGGER.warning("Qiara: could not activate camera shutter: %s", err)
 
         # Reset the idle timer — shutter closes if no segment arrives within _IDLE_TIMEOUT
-        self._reset_idle_timer(hass, api, node_id_int)
+        self._reset_idle_timer(hass, api, key)
 
         tail = f"{quality}/{file}" if quality else file
         upstream_url = f"{api._base_url}/home/stream/{tail}"
@@ -229,39 +270,38 @@ class QiaraCameraStreamProxy(HomeAssistantView):
             _LOGGER.warning("Qiara stream proxy error for %s: %s", tail, err)
             return web.Response(status=502, text=str(err))
 
-    def _reset_idle_timer(self, hass: HomeAssistant, api, node_id: int) -> None:
+    def _reset_idle_timer(self, hass: HomeAssistant, api, key: tuple[str, int]) -> None:
         """Cancel any existing idle timer and start a fresh one."""
-        existing = self._idle_tasks.pop(node_id, None)
+        existing = self._idle_tasks.pop(key, None)
         if existing:
             existing.cancel()
         # Background task so HA cancels it automatically at shutdown instead of
         # warning that a non-critical task is still running.
-        self._idle_tasks[node_id] = hass.async_create_background_task(
-            self._close_after_idle(api, node_id),
-            name=f"qiara_camera_{node_id}_idle_close",
+        self._idle_tasks[key] = hass.async_create_background_task(
+            self._close_after_idle(api, key),
+            name=f"qiara_camera_{key[0]}_{key[1]}_idle_close",
         )
 
-    async def _close_after_idle(self, api, node_id: int) -> None:
+    async def _close_after_idle(self, api, key: tuple[str, int]) -> None:
         """Close the shutter after the idle timeout expires."""
         try:
             await asyncio.sleep(self._IDLE_TIMEOUT)
         except asyncio.CancelledError:
             return
-        _LOGGER.debug("Qiara: camera %s stream idle — closing shutter", node_id)
+        _LOGGER.debug("Qiara: camera %s stream idle — closing shutter", key[1])
         try:
-            await api.async_deactivate_camera(node_id)
+            await api.async_deactivate_camera(key[1])
         except Exception as err:
             _LOGGER.warning("Qiara: failed to close shutter after idle: %s", err)
         finally:
-            self._shutter_open.discard(node_id)
-            self._idle_tasks.pop(node_id, None)
+            self._shutter_open.discard(key)
+            self._idle_tasks.pop(key, None)
 
-    def shutdown(self) -> None:
-        """Cancel outstanding idle timers (called when an entry unloads)."""
-        for task in self._idle_tasks.values():
-            task.cancel()
-        self._idle_tasks.clear()
-        self._shutter_open.clear()
+    def shutdown(self, entry_id: str) -> None:
+        """Cancel the entry's outstanding idle timers (called when it unloads)."""
+        for key in [k for k in self._idle_tasks if k[0] == entry_id]:
+            self._idle_tasks.pop(key).cancel()
+        self._shutter_open = {k for k in self._shutter_open if k[0] != entry_id}
 
 
 class QiaraCamera(CoordinatorEntity, Camera):
@@ -279,7 +319,9 @@ class QiaraCamera(CoordinatorEntity, Camera):
         CoordinatorEntity.__init__(self, coordinator)
         Camera.__init__(self)
         self._sensor_id = sensor_id
-        self._attr_unique_id = f"qiara_camera_{sensor_id}"
+        self._entry_id = entry.entry_id
+        self._device_key = camera_device_key(entry, sensor_id)
+        self._attr_unique_id = camera_unique_id(entry, sensor_id)
         self._last_image: bytes | None = None
         self._last_image_ts: float = 0.0
         self._shutter_task: asyncio.Task | None = None
@@ -318,7 +360,7 @@ class QiaraCamera(CoordinatorEntity, Camera):
     @property
     def device_info(self) -> dict:
         return {
-            "identifiers": {(DOMAIN, self._sensor_id)},
+            "identifiers": {(DOMAIN, self._device_key)},
             "name": self.name,
             "manufacturer": "Qiara",
         }
@@ -383,9 +425,9 @@ class QiaraCamera(CoordinatorEntity, Camera):
             return None
         return session, url
 
-    @staticmethod
-    def _go2rtc_stream_name(camera_node_id: int) -> str:
-        return f"qiara_camera_{camera_node_id}"
+    def _go2rtc_stream_name(self, camera_node_id: int) -> str:
+        # Scoped by entry: every slave camera reports the same node id.
+        return f"qiara_camera_{self._entry_id}_{camera_node_id}"
 
     def _go2rtc_rtsp_url(self, camera_node_id: int) -> str:
         return f"rtsp://127.0.0.1:{GO2RTC_RTSP_PORT}/{self._go2rtc_stream_name(camera_node_id)}"
@@ -413,7 +455,7 @@ class QiaraCamera(CoordinatorEntity, Camera):
 
         ha_url = get_url(self.hass, allow_internal=True)
         return (
-            f"{ha_url}/api/qiara/camera/{proxy.token}/{camera_node_id}"
+            f"{ha_url}/api/qiara/camera/{proxy.token}/{self._entry_id}/{camera_node_id}"
             f"/stream/{stream_name}.m3u8"
         )
 

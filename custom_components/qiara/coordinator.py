@@ -11,6 +11,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .api import QiaraApi
+from .const import CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,7 +38,9 @@ class QiaraDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name="Qiara",
-            update_interval=timedelta(seconds=60),
+            update_interval=timedelta(
+                seconds=entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+            ),
             config_entry=entry,
         )
 
@@ -46,7 +49,12 @@ class QiaraDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             sensors = await self.api.async_get_sensors()
             result: dict[str, Any] = {sensor.id: sensor for sensor in sensors}
-            result["alarm_state"] = await self.api.async_get_alarm_state()
+            # A slave camera has no alarm node: nothing to read.
+            result["alarm_state"] = (
+                await self.api.async_get_alarm_state()
+                if self.api.get_alarm_node_id() is not None
+                else None
+            )
             return result
         except ConfigEntryAuthFailed:
             raise

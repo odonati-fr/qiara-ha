@@ -54,6 +54,11 @@ async def async_setup_entry(
 ) -> None:
     """Set up Qiara alarm control panel from a config entry."""
     coordinator: QiaraDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    # Only the master camera carries the alarm (Node.HlAlarm); a slave camera
+    # entry exposes its camera alone.
+    if coordinator.api.get_alarm_node_id() is None:
+        _LOGGER.debug("Qiara: no alarm node on %s, skipping the alarm panel", entry.title)
+        return
     async_add_entities([QiaraAlarmControlPanel(coordinator, entry)])
 
 

@@ -8,6 +8,13 @@ CONF_SECRET_KEY = "secret_key"
 CONF_HOST = "host"
 CONF_PORT = "port"
 CONF_BASE_URL = "base_url"
+CONF_SCAN_INTERVAL = "scan_interval"
+
+# Polling interval in seconds (options flow). The device pushes nothing, so
+# this is the delay before an opening or a motion reaches HA.
+DEFAULT_SCAN_INTERVAL = 60
+MIN_SCAN_INTERVAL = 5
+MAX_SCAN_INTERVAL = 300
 
 # The Qiara hub is polled directly on the LAN over HTTPS (self-signed cert).
 # Users enter just the host; the API port (64218) and path (/api/v1) are the
