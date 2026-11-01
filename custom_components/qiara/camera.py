@@ -125,11 +125,11 @@ def _migrate_camera_ids(hass: HomeAssistant, entry: ConfigEntry) -> None:
         ent_reg.async_update_entity(
             reg_entry.entity_id, new_unique_id=camera_unique_id(entry, node_id)
         )
-        device = dev_reg.async_get_device(identifiers={(DOMAIN, node_id)})
-        if device is not None and entry.entry_id in device.config_entries:
-            dev_reg.async_update_device(
-                device.id, new_identifiers={(DOMAIN, camera_device_key(entry, node_id))}
-            )
+        for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+            if (DOMAIN, node_id) in device.identifiers:
+                dev_reg.async_update_device(
+                    device.id, new_identifiers={(DOMAIN, camera_device_key(entry, node_id))}
+                )
 
 
 def camera_unique_id(entry: ConfigEntry, node_id: str) -> str:
