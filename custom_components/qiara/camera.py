@@ -578,7 +578,9 @@ class QiaraCamera(CoordinatorEntity, Camera):
         gives up and closes it if the stream never started. Also closes it if
         cancelled (entity removed), unless a newer session owns the shutter.
         """
-        poll, grace, startup = 10, 2, 6
+        # Polls are a local HTTP call to go2rtc, only while viewing: keep them
+        # short so the shutter closes a few seconds after the last viewer.
+        poll, grace, startup = 3, 2, 20
         idle = polls = 0
         seen = False
         streams_url = url.rstrip("/") + "/api/streams"
